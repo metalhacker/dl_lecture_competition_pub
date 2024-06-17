@@ -2,9 +2,11 @@ import torch
 import hydra
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 import random
 import numpy as np
 from src.models.evflownet import EVFlowNet
+from src.models.transflownet import TransFlowNet
 from src.datasets import DatasetProvider
 from enum import Enum, auto
 from src.datasets import train_collate
@@ -35,6 +37,16 @@ def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
     '''
     epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
     return epe
+
+def deep_supervision_loss(flow_dict, gt_flow, weight_dict = {'flow3': 0.5, 'flow2': 0.25, 'flow1': 0.125, 'flow0': 0.0625}):
+    loss3 = compute_epe_error(flow_dict['flow3'], gt_flow) * weight_dict['flow3']
+    loss2 = compute_epe_error(F.interpolate(flow_dict['flow2'], size = flow_dict['flow3'].shape[2:], mode = 'bilinear'), gt_flow) * weight_dict['flow2']
+    loss1 = compute_epe_error(F.interpolate(flow_dict['flow1'], size = flow_dict['flow3'].shape[2:], mode = 'bilinear'), gt_flow) * weight_dict['flow1']
+    loss0 = compute_epe_error(F.interpolate(flow_dict['flow0'], size = flow_dict['flow3'].shape[2:], mode = 'bilinear'), gt_flow) * weight_dict['flow0']
+
+    loss = loss3 + loss2 + loss1 + loss0
+
+    return loss
 
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
@@ -110,8 +122,8 @@ def main(args: DictConfig):
     # ------------------
     #       Model
     # ------------------
-    model = EVFlowNet(args.train).to(device)
-
+    # model = EVFlowNet(args.train).to(device)
+    model = TransFlowNet(args.train).to(device)
     # ------------------
     #   optimizer
     # ------------------
@@ -121,21 +133,33 @@ def main(args: DictConfig):
     # ------------------
     model.train()
     for epoch in range(args.train.epochs):
-        total_loss = 0
+        total_loss_epe = 0
+        total_loss_deep = 0
         print("on epoch: {}".format(epoch+1))
         for i, batch in enumerate(tqdm(train_data)):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
             ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
-            print(f"batch {i} loss: {loss.item()}")
+            # flow = model(event_image) # [B, 2, 480, 640]
+            flow, flow_dict = model(event_image) # [B, 2, 480, 640]
+
+            loss_epe: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            print(f"\nbatch {i} EPE loss: {loss_epe.item()}")
+
+
+            loss_deep: torch.Tensor = deep_supervision_loss(flow_dict, ground_truth_flow)
+            print(f"batch {i} Deep loss: {loss_deep.item()}")
             optimizer.zero_grad()
-            loss.backward()
+            loss_deep.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+
+            total_loss_epe += loss_epe.item()
+            total_loss_deep += loss_deep.item()
+
+            # torch.cuda.empty_cache()
+
+        print(f'Epoch {epoch+1}, EPE Loss: {total_loss_epe / len(train_data)}, Deep Loss: {total_loss_deep / len(train_data)}')
 
     # Create the directory if it doesn't exist
     if not os.path.exists('checkpoints'):
@@ -156,14 +180,15 @@ def main(args: DictConfig):
         print("start test")
         for batch in tqdm(test_data):
             batch: Dict[str, Any]
-            event_image = batch["event_volume_old"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
-            flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
+            event_image = batch["event_volume"].to(device)
+            batch_flow, _ = model(event_image) # [1, 2, 480, 640]
+            # flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
+            flow = torch.cat((flow, batch_flow), dim=0)
         print("test done")
     # ------------------
     #  save submission
     # ------------------
-    file_name = "submission.npy"
+    file_name = "submission"
     save_optical_flow_to_npy(flow, file_name)
 
 if __name__ == "__main__":
